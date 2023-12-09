@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Sign Detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        .container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .videoContainer {
+            flex-grow: 1;
+        }
+
+        #sentenceDisplay {
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-family: 'Roboto', sans-serif;
+            font-size: 24px;
+            font-weight: 300;
+        }
+            #chartContainer {
+            flex-basis: 25%;
+            padding-right: 100px;
+            max-width: 300px;
+            height: 300px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="videoContainer">
+            <video class="input_video" style="display: none;"></video>
+            <canvas class="output_canvas" width="1280px" height="720px"></canvas>
+            <div id="sentenceDisplay"></div>
+        </div>
+        <div id="chartContainer">
+            <canvas id="probChart"></canvas>
+        </div>
+        
+    </div>
+    <script type="module">
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        const canvasElement = document.getElementsByClassName('output_canvas')[0];
+        const canvasCtx = canvasElement.getContext('2d');
+        const actions = ['hello', 'thanks', 'I love you'];
+        let sequence = [];
+        let sentence = [];
+        let predictions = [];
+        let threshold = 0.5;
+        let model;
+        let myChart; 
+        let keypoints;
+
+        class ScaledDotProductAttention extends tf.layers.Layer {
+            constructor(config) {
+                super(config);
+                this.dropout = tf.layers.dropout({ rate: config.attentionDropout || 0.0 });
+            }
+
+            call([q, k, v]) {
+                const dK = k.shape[-1];
+                let attn = tf.matMul(q, k, false, true).div(tf.sqrt(dK));
+                if (mask != null) {
+                    attn = attn.add(mask.mul(-1e9));
+                }
+                const attnWeights = this.dropout.apply(tf.softmax(attn, -1));
+                return tf.matMul(attnWeights, v);
+            }
+
+            static get className() {
+                return 'ScaledDotProductAttention';
+            }
+        }
+        class MultiheadAttention extends tf.layers.Layer {
+            constructor(config) {
+                super(config);
+                this.numHeads = config.numHeads;
+                this.dModel = config.dModel;
+                this.depth = this.dModel / this.numHeads;
+
+                this.wQ = tf.layers.dense({ units: this.dModel });
+                this.wK = tf.layers.dense({ units: this.dModel });
+                this.wV = tf.layers.dense({ units: this.dModel });
+
+                this.attention = new ScaledDotProductAttention({ attentionDropout: config.attentionDropout || 0.0 });
+                this.dense = tf.layers.dense({ units: this.dModel });
+            }
+
+            splitHeads(x) {
+                const batchSize = x.shape[0];
+                return x.reshape([batchSize, -1, this.numHeads, this.depth]).transpose([0, 2, 1, 3]);
+            }
+
+            call(inputs) {
+                let q = inputs;
+                let k = inputs;
+                let v = inputs;
+
+                q = this.splitHeads(this.wQ.apply(q));
+                k = this.splitHeads(this.wK.apply(k));
+                v = this.splitHeads(this.wV.apply(v));
+
+                const scaledAttention = this.attention.call([q, k, v]);
+                const concatAttention = scaledAttention.transpose([0, 2, 1, 3]).reshape([batchSize, -1, this.dModel]);
+
+                return this.dense.apply(concatAttention);
+            }
+
+            static get className() {
+                return 'MultiheadAttention';
+            }
+        }
+
+        class PositionalEncoding extends tf.layers.Layer {
+            constructor(config) {
+                super(config);
+                this.position = config.position || 30;  // Default to 30 if not provided
+                this.dModel = config.dModel || 512;  // Default to 512 if not provided
+                this.posEncoding = this.positionalEncoding();
+            }
+
+            positionalEncoding() {
+                const pos = tf.range(0, this.position, 1).expandDims(1);
+                const i = tf.range(0, this.dModel, 1).expandDims(0);
+                const angleRads = pos.div(tf.pow(10000, i.div(this.dModel)));
+
+                // Apply sin to the even indices in the array; 2i
+                const sines = tf.sin(angleRads.slice([0, 0], [-1, this.dModel / 2]));
+
+                // Apply cos to the odd indices in the array; 2i+1
+                const cosines = tf.cos(angleRads.slice([0, this.dModel / 2], [-1, -1]));
+
+                const posEncoding = tf.concat([sines, cosines], 1);
+                return posEncoding.expandDims(0);
+            }
+
+            call(inputs) {
+                return tf.add(inputs, this.posEncoding.slice([0, 0, 0], [-1, inputs.shape[1], -1]));
+            }
+
+            static get className() {
+                return 'PositionalEncoding';
+            }
+        }
+
+        tf.serialization.registerClass(MultiheadAttention);
+        tf.serialization.registerClass(ScaledDotProductAttention);
+        tf.serialization.registerClass(PositionalEncoding);
+
+        model = await tf.loadGraphModel('https://tensorflowjs-model.s3.amazonaws.com/model.json');
+
+        function extractKeypoints(results) {
+            const poseLandmarks = results.poseLandmarks ? results.poseLandmarks.map(landmark => [landmark.x, landmark.y, landmark.z, landmark.visibility]).flat() : new Array(33 * 4).fill(0);
+
+            const faceLandmarks = results.faceLandmarks ? results.faceLandmarks.map(landmark => [landmark.x, landmark.y, landmark.z]).flat() : new Array(468 * 3).fill(0);
+
+            const leftHandLandmarks = results.leftHandLandmarks ? results.leftHandLandmarks.map(landmark => [landmark.x, landmark.y, landmark.z]).flat() : new Array(21 * 3).fill(0);
+
+            const rightHandLandmarks = results.rightHandLandmarks ? results.rightHandLandmarks.map(landmark => [landmark.x, landmark.y, landmark.z]).flat() : new Array(21 * 3).fill(0);
+
+            return [...poseLandmarks, ...faceLandmarks, ...leftHandLandmarks, ...rightHandLandmarks];
+        }
+
+        function updateChart(newData) {
+            if(myChart) {
+                myChart.data.datasets[0].data = newData; // Adjust the data
+                myChart.update(); // Update the chart
+            } else {
+                // Code to create the chart for the first time
+                let ctx = document.getElementById('probChart').getContext('2d');
+                myChart = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: actions,
+                        datasets: [{
+                            data: newData,
+                            backgroundColor: ['rgba(245, 117, 16, 0.5)', 'rgba(117, 245, 16, 0.5)', 'rgba(16, 117, 245, 0.5)']
+                        }]
+                    }
+                });
+            }
+        }
+
+        function updateSentenceDisplay() {
+            const colorMap = {
+                'hello': 'rgb(245,117,16)', // light orange
+                'thanks': 'rgb(117,245,16)', // light green
+                'I love you': 'rgb(16,117,245)' // light blue
+            };
+
+            const sentenceDisplay = document.getElementById('sentenceDisplay');
+            sentenceDisplay.innerHTML = ''; // Clear previous content
+
+            sentence.forEach(word => {
+                const span = document.createElement('span');
+                span.textContent = word + ' ';
+                span.style.color = colorMap[word] || 'black'; // Default to black if the word is not in the colorMap
+                sentenceDisplay.appendChild(span);
+            });
+        }
+
+
+        function onResults(results) {
+            keypoints = extractKeypoints(results);
+            sequence.push(keypoints);
+            if (sequence.length > 30) sequence.shift(); // Keep only the last 30 frames
+
+            //Prediction logic
+            if (sequence.length === 30) {
+                const inputTensor = tf.tensor2d(sequence).expandDims(0);
+                const res = model.predict(inputTensor).dataSync();
+
+                // Call this function every time you want to update the probability chart.
+                // updateProbabilityChart(res, actions, colors);
+                updateChart(res);
+
+                const argMax = tf.argMax(res).dataSync()[0];
+                predictions.push(argMax);
+
+                /// Visualization logic
+                if (predictions.slice(-10).every(val => val === argMax)) {
+                    if (res[argMax] > threshold) {
+                        const sentenceDisplayDiv = document.getElementById('sentenceDisplay');
+
+                        if (sentence.length > 0 && sentence[sentence.length - 1] !== actions[argMax]) {
+                            sentence.push(actions[argMax]);
+                        } else if (sentence.length === 0) {
+                            sentence.push(actions[argMax]);
+                        }
+                        updateSentenceDisplay();
+                    }
+                }
+
+                if (sentence.length > 5) sentence.shift(); // Keep only the last 5 actions
+            }
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            // Only overwrite existing pixels.
+            canvasCtx.globalCompositeOperation = 'source-in';
+            canvasCtx.fillStyle = '#00FF00';
+            canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+
+            // Only overwrite missing pixels.
+            canvasCtx.globalCompositeOperation = 'destination-atop';
+            canvasCtx.drawImage(
+                results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            canvasCtx.globalCompositeOperation = 'source-over';
+
+            const faceDrawingSpec = { color: [80, 256, 121], lineWidth: 1, circleRadius: 1 };
+            const poseDrawingSpec = { color: [80, 44, 121], lineWidth: 2, circleRadius: 2 };
+            const leftHandDrawingSpec = { color: [121, 44, 250], lineWidth: 2, circleRadius: 2 };
+            const rightHandDrawingSpec = { color: [245, 66, 230], lineWidth: 2, circleRadius: 2 };
+
+            // Draw Face Landmarks
+            if (results.faceLandmarks) {
+                drawConnectors(canvasCtx, results.faceLandmarks, FACEMESH_CONTOURS, { color: [80, 110, 10] });
+                drawLandmarks(canvasCtx, results.faceLandmarks, faceDrawingSpec, faceDrawingSpec);
+            }
+
+            // Draw Pose Landmarks
+            if (results.poseLandmarks) {
+                drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, { color: [80, 22, 10] });
+                drawLandmarks(canvasCtx, results.poseLandmarks, poseDrawingSpec, poseDrawingSpec);
+            }
+
+            // Draw Left Hand Landmarks
+            if (results.leftHandLandmarks) {
+                drawConnectors(canvasCtx, results.leftHandLandmarks, HAND_CONNECTIONS, { color: [121, 22, 76] });
+                drawLandmarks(canvasCtx, results.leftHandLandmarks, leftHandDrawingSpec, leftHandDrawingSpec);
+            }
+
+            // Draw Right Hand Landmarks
+            if (results.rightHandLandmarks) {
+                drawConnectors(canvasCtx, results.rightHandLandmarks, HAND_CONNECTIONS, { color: [245, 117, 66] });
+                drawLandmarks(canvasCtx, results.rightHandLandmarks, rightHandDrawingSpec, rightHandDrawingSpec);
+            }
+            canvasCtx.restore();
+        }
+
+        const holistic = new Holistic({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`;
+            }
+        });
+        holistic.setOptions({
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        holistic.onResults(onResults);
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await holistic.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+    </script>
+</body>
+
+</html>
